@@ -20,19 +20,20 @@ def printDebugInfo(*args):
     # print("[DEBUG] [%.3f]"%(time.time()), *args)
     pass
 
-DATASET_LIST = ['CREMAD', 'AVE', 'MVSA', 'IEMOCAP', 'IEMOCAP3', 'URFUNNY']
+DATASET_LIST = ['CREMAD', 'AVE', 'MVSA', 'IEMOCAP', 'IEMOCAP3', 'URFUNNY', 'TCGA']
 TVA_SET_LIST = ["URFUNNY", "IEMOCAP3"]
-AV_SET_LIST = ["CREMAD", "AVE", 'IEMOCAP']
-TV_SET_LIST = ["MVSA"]
+AV_SET_LIST  = ["CREMAD", "AVE", 'IEMOCAP', 'TCGA']
+TV_SET_LIST  = ["MVSA"]
 
 # datasets have 2 modalities, because some methods only support 2 modalities
-M2DATASET_LIST = ["MVSA", "CREMAD", "AVE", "IEMOCAP" ]
+M2DATASET_LIST = ["MVSA", "CREMAD", "AVE", "IEMOCAP", "TCGA"]
 # datasets have 3 modalities
 M3DATASET_LIST = ["IEMOCAP3", "URFUNNY"]
 
-DATASET_HAS_AUDIO_LIST = ['AVE', 'CREMAD', 'IEMOCAP', 'IEMOCAP3', 'URFUNNY']
-DATASET_HAS_VISUAL_LIST = ['AVE', 'CREMAD', 'MVSA', 'IEMOCAP', 'IEMOCAP3', 'URFUNNY']
-DATASET_HAS_TEXT_LIST = ['MVSA', 'IEMOCAP3', 'URFUNNY']
+# TCGA uses the 'v' slot for CLAM patches and the 'a' slot for multi-omics.
+DATASET_HAS_AUDIO_LIST  = ['AVE', 'CREMAD', 'IEMOCAP', 'IEMOCAP3', 'URFUNNY', 'TCGA']
+DATASET_HAS_VISUAL_LIST = ['AVE', 'CREMAD', 'MVSA', 'IEMOCAP', 'IEMOCAP3', 'URFUNNY', 'TCGA']
+DATASET_HAS_TEXT_LIST   = ['MVSA', 'IEMOCAP3', 'URFUNNY']
 
 
 def get_num_classes(dataset):
@@ -42,7 +43,8 @@ def get_num_classes(dataset):
         'AVE': 28,
         'IEMOCAP': 5,
         'IEMOCAP3': 5,
-        'URFUNNY': 2
+        'URFUNNY': 2,
+        'TCGA': 5,   # cancer subtypes: LumA, LumB, Her2, Basal, Normal
     }
     if dataset not in dataset_classes_map:
         raise NotImplementedError('Incorrect dataset name {}'.format(dataset))
@@ -51,13 +53,16 @@ def get_num_classes(dataset):
     return dataset_classes_map[dataset]
 
 def build_train_val_test_datasets(args):
+    from .tcga_dummy_dataset import TCGADataset   # local import avoids circular deps
+
     dataset_classes = {
-        'MVSA': TVDataset,
-        'CREMAD': AVDataset,
-        'AVE': AVDataset,
+        'MVSA':    TVDataset,
+        'CREMAD':  AVDataset,
+        'AVE':     AVDataset,
         'IEMOCAP': AVDataset,
         'IEMOCAP3': TVADataset,
-        'URFUNNY': TVADataset
+        'URFUNNY': TVADataset,
+        'TCGA':    TCGADataset,
     }
 
     if args.dataset not in dataset_classes:
@@ -65,8 +70,8 @@ def build_train_val_test_datasets(args):
 
     DatasetClass = dataset_classes[args.dataset]
     train_dataset = DatasetClass(args, mode='train')
-    val_dataset = DatasetClass(args, mode='val')
-    test_dataset = DatasetClass(args, mode='test')
+    val_dataset   = DatasetClass(args, mode='val')
+    test_dataset  = DatasetClass(args, mode='test')
 
     return train_dataset, val_dataset, test_dataset
 

@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__)) + "/../"
 
 CREMAD_ROOT = '/mimer/NOBACKUP/groups/multimodal_learning/code_refactoring/CREMA-D'
 AVE_ROOT = '/mimer/NOBACKUP/groups/multimodal_learning/code_refactoring/AVE_Dataset'
-MVSA_ROOT = '/mimer/NOBACKUP/groups/multimodal_learning/code_refactoring/MVSA_Single'
+MVSA_ROOT = '/home/phues/AMST-PI/MVSA_Single'
 IEMOCAP_ROOT = '/mimer/NOBACKUP/groups/multimodal_learning/code_refactoring/IEMOCAP_PROCESSED' 
 URFUNNY_ROOT = '/mimer/NOBACKUP/groups/multimodal_learning/code_refactoring/UR-FUNNY'
 
@@ -74,7 +74,20 @@ DATA_PATH_CONFIG = {
         "train_txt": PROJECT_ROOT + "data/UR-FUNNY/ur_funny_train.txt",
         "val_txt": PROJECT_ROOT + "data/UR-FUNNY/ur_funny_valid.txt",
         "test_txt": PROJECT_ROOT + "data/UR-FUNNY/ur_funny_test.txt"
-    }
+    },
+    # ----------------------------------------------------------------
+    # TCGA: CLAM patch bags (visual slot) + multi-omics (audio slot)
+    # Default root is /tmp/tcga_dummy; override with --data_path.
+    # The dummy generator in tcga_dummy_dataset.py creates the files
+    # automatically on first run, so no real TCGA data is needed.
+    # ----------------------------------------------------------------
+    "TCGA": {
+        "data_root": '/tmp/tcga_dummy',
+        "stat_path": '/tmp/tcga_dummy/stat_tcga.txt',
+        "train_txt": '/tmp/tcga_dummy/train.txt',
+        "val_txt":   '/tmp/tcga_dummy/val.txt',
+        "test_txt":  '/tmp/tcga_dummy/test.txt',
+    },
 }
 
 def get_data_path_config(args, mode):     

@@ -410,6 +410,16 @@ class BasicTrainer:
                 M_AUDIO_NAME: audio_features,
                 M_VISUAL_NAME: images
             }
+        elif dataset == 'TCGA':
+            # patches: (B, N_patches, PATCH_DIM) → visual slot
+            # omics  : (B, OMICS_DIM)            → audio slot
+            patches, omics, labels, extra_infos = data_packet
+            patches = patches.to(device_map[M_VISUAL_NAME]).float()
+            omics   = omics.to(device_map[M_AUDIO_NAME]).float()
+            input_dict = {
+                M_VISUAL_NAME: patches,
+                M_AUDIO_NAME:  omics,
+            }
         elif dataset in AV_SET_LIST:
             audio_features, images, labels, extra_infos = data_packet
             audio_features = audio_features.to(device_map[M_AUDIO_NAME]).unsqueeze(1).float()

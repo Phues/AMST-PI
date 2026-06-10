@@ -3,7 +3,7 @@
 *.py[cod]
 *.pyo
 *.pyd
-
+MVSA_Single/
 #
 Jobs/my_venv
 ckpt/

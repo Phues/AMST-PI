@@ -4,21 +4,31 @@ import torch.nn.functional as F
 from .backbone import resnet18
 from dataset.dataset import get_num_classes
 from transformers import RobertaModel
-from .fusion_modules import gen_fusion_v2
+from .fusion_modules import gen_fusion_v2, GradModifier, MLASum
 
 from dataset.dataset import DATASET_HAS_VISUAL_LIST, \
     DATASET_HAS_AUDIO_LIST, DATASET_HAS_TEXT_LIST
 
 # modality name
-M_TEXT_NAME = 't'
-M_AUDIO_NAME = 'a'
+M_TEXT_NAME   = 't'
+M_AUDIO_NAME  = 'a'
 M_VISUAL_NAME = 'v'
 
-KEY_HELPERS = 'helpers'
+KEY_HELPERS  = 'helpers'
 KEY_ENCODERS = 'encoders'
-KEY_FUSION = 'fusion'
-KEY_TEXT_TOKENS = 'tokens'
+KEY_FUSION   = 'fusion'
+KEY_TEXT_TOKENS       = 'tokens'
 KEY_TEXT_PADDING_MASK = 'padding_mask'
+
+# ------------------------------------------------------------------
+# TCGA modality constants (re-use 'a'/'v' slots)
+# ------------------------------------------------------------------
+# CLAM patch bag → visual slot ('v')
+TCGA_PATCH_DIM  = 1024   # ResNet-50 CLAM feature dimension
+TCGA_EMBED_DIM  = 512    # projected embedding fed to the shared head
+
+# Multi-omics vector → audio slot ('a')
+TCGA_OMICS_DIM  = 1024   # raw omics feature vector length
 
 
 # visual encoder, based on ResNet18
@@ -118,6 +128,91 @@ class TextEncoder(nn.Module):
         # Use the [CLS] embedding (first token).
         cls_emb = outputs.last_hidden_state[:, 0, :]
         return cls_emb
+
+
+# ------------------------------------------------------------------
+# TCGA encoder 1: CLAM patch-bag encoder (visual slot)
+#
+# Input : FloatTensor (B, N_patches, PATCH_DIM)
+# Output: FloatTensor (B, embed_dim)
+#
+# Uses a one-layer attention-MIL pooling:
+#   scores = softmax( tanh(W1 h) ⊙ sigmoid(W2 h) )
+#   z      = Σ scores_i · h_i
+#   out    = FC(z)
+# This is the standard ABMIL formulation (Ilse et al., 2018) used by CLAM.
+# ------------------------------------------------------------------
+class CLAMPatchEncoder(nn.Module):
+    def __init__(self, patch_dim: int = 1024, embed_dim: int = 512,
+                 attention_dim: int = 256):
+        super().__init__()
+        self.patch_proj = nn.Linear(patch_dim, embed_dim)
+
+        # Gated attention (ABMIL)
+        self.attn_V = nn.Linear(embed_dim, attention_dim)   # tanh branch
+        self.attn_U = nn.Linear(embed_dim, attention_dim)   # sigmoid branch
+        self.attn_w = nn.Linear(attention_dim, 1)
+
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm     = nn.LayerNorm(embed_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, N, PATCH_DIM)
+        Returns:
+            (B, embed_dim)
+        """
+        # Project patches to embed_dim
+        h = torch.relu(self.patch_proj(x))               # (B, N, E)
+
+        # Gated attention scores
+        A = torch.tanh(self.attn_V(h)) \
+            * torch.sigmoid(self.attn_U(h))              # (B, N, A)
+        A = self.attn_w(A)                               # (B, N, 1)
+        A = torch.softmax(A, dim=1)                      # (B, N, 1)
+
+        # Weighted sum of patch embeddings
+        z = (A * h).sum(dim=1)                           # (B, E)
+        z = self.norm(self.out_proj(z))
+        return z
+
+
+# ------------------------------------------------------------------
+# TCGA encoder 2: Multi-omics encoder (audio slot)
+#
+# Input : FloatTensor (B, OMICS_DIM)
+# Output: FloatTensor (B, embed_dim)
+#
+# Three-layer MLP with BatchNorm, matching the embedding dimension of
+# CLAMPatchEncoder so both modalities reach the shared head with the
+# same feature dimension.
+# ------------------------------------------------------------------
+class OmicsEncoder(nn.Module):
+    def __init__(self, omics_dim: int = 1024, embed_dim: int = 512,
+                 hidden_dim: int = 512, dropout: float = 0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(omics_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim),
+            nn.LayerNorm(embed_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, OMICS_DIM)
+        Returns:
+            (B, embed_dim)
+        """
+        return self.net(x)
     
 # For testing single modality
 # Single modality (visual or audio) model, based on ResNet18
@@ -194,45 +289,101 @@ def gen_model(args):
     embedding_dim = 512
     dataset = args.dataset
     class_num = get_num_classes(args.dataset)
-    
+
     model_dict = nn.ModuleDict({
-        KEY_HELPERS: nn.ModuleDict(),
+        KEY_HELPERS:  nn.ModuleDict(),
         KEY_ENCODERS: nn.ModuleDict(),
-        KEY_FUSION: None
+        KEY_FUSION:   None
     })
-    
-    if dataset in DATASET_HAS_TEXT_LIST:
-        print("Text model initialized")
-        embedding_dim = 768
-        model_dict[KEY_ENCODERS][M_TEXT_NAME] = TextEncoder(
-            model_name="roberta-base", 
-            fine_tune=True, 
-            unfreeze_last_n_layers=5)
-        model_dict[KEY_HELPERS][M_TEXT_NAME] = nn.Linear(embedding_dim, class_num)
-        model_dict[KEY_HELPERS][M_TEXT_NAME].apply(weight_init)
-    
-    if dataset in DATASET_HAS_VISUAL_LIST:
-        print("Visual model initialized")
-        model_dict[KEY_ENCODERS][M_VISUAL_NAME] = _ResNet18_V(output_dim=embedding_dim)
+
+    # ------------------------------------------------------------------
+    # TCGA: swap standard encoders for domain-specific ones.
+    # Visual slot ('v') → CLAMPatchEncoder
+    # Audio  slot ('a') → OmicsEncoder
+    # ------------------------------------------------------------------
+    if dataset == 'TCGA':
+        embedding_dim = TCGA_EMBED_DIM
+
+        print("CLAM patch encoder initialized (visual slot)")
+        model_dict[KEY_ENCODERS][M_VISUAL_NAME] = CLAMPatchEncoder(
+            patch_dim=TCGA_PATCH_DIM, embed_dim=embedding_dim)
         model_dict[KEY_ENCODERS][M_VISUAL_NAME].apply(weight_init)
         model_dict[KEY_HELPERS][M_VISUAL_NAME] = nn.Linear(embedding_dim, class_num)
         model_dict[KEY_HELPERS][M_VISUAL_NAME].apply(weight_init)
-    
-    if dataset in DATASET_HAS_AUDIO_LIST:
-        print("Audio model initialized")
-        model_dict[KEY_ENCODERS][M_AUDIO_NAME] = _ResNet18_A(output_dim=embedding_dim)
+
+        print("Omics MLP encoder initialized (audio slot)")
+        model_dict[KEY_ENCODERS][M_AUDIO_NAME] = OmicsEncoder(
+            omics_dim=TCGA_OMICS_DIM, embed_dim=embedding_dim)
         model_dict[KEY_ENCODERS][M_AUDIO_NAME].apply(weight_init)
         model_dict[KEY_HELPERS][M_AUDIO_NAME] = nn.Linear(embedding_dim, class_num)
         model_dict[KEY_HELPERS][M_AUDIO_NAME].apply(weight_init)
-        
+
+    else:
+        if dataset in DATASET_HAS_TEXT_LIST:
+            print("Text model initialized")
+            embedding_dim = 768
+            model_dict[KEY_ENCODERS][M_TEXT_NAME] = TextEncoder(
+                model_name="roberta-base",
+                fine_tune=True,
+                unfreeze_last_n_layers=5)
+            model_dict[KEY_HELPERS][M_TEXT_NAME] = nn.Linear(embedding_dim, class_num)
+            model_dict[KEY_HELPERS][M_TEXT_NAME].apply(weight_init)
+
+        if dataset in DATASET_HAS_VISUAL_LIST:
+            print("Visual model initialized")
+            model_dict[KEY_ENCODERS][M_VISUAL_NAME] = _ResNet18_V(output_dim=embedding_dim)
+            model_dict[KEY_ENCODERS][M_VISUAL_NAME].apply(weight_init)
+            model_dict[KEY_HELPERS][M_VISUAL_NAME] = nn.Linear(embedding_dim, class_num)
+            model_dict[KEY_HELPERS][M_VISUAL_NAME].apply(weight_init)
+
+        if dataset in DATASET_HAS_AUDIO_LIST:
+            print("Audio model initialized")
+            model_dict[KEY_ENCODERS][M_AUDIO_NAME] = _ResNet18_A(output_dim=embedding_dim)
+            model_dict[KEY_ENCODERS][M_AUDIO_NAME].apply(weight_init)
+            model_dict[KEY_HELPERS][M_AUDIO_NAME] = nn.Linear(embedding_dim, class_num)
+            model_dict[KEY_HELPERS][M_AUDIO_NAME].apply(weight_init)
+
     modality_name_list = list(model_dict[KEY_ENCODERS].keys())
     modality_name_list.sort()
-    
+
     model_dict[KEY_FUSION] = gen_fusion_v2(
         args, embedding_dim, class_num, modality_name_list)
     model_dict[KEY_FUSION].apply(weight_init)
 
     return model_dict
+
+
+def gen_alt_fusion_with_grad_mod(args, embedding_dim: int) -> MLASum:
+    """
+    Build the alternating module's shared head (MLASum) with a GradModifier
+    attached.  Called by AMST_F_Trainer so the alt fusion head benefits from
+    MLA-style gradient orthogonalisation while the joint head does not.
+
+    Args:
+        args:          training args (used for dataset / class count).
+        embedding_dim: dimension of each encoder's output.
+
+    Returns:
+        An MLASum instance whose .grad_modifier is a freshly initialised
+        GradModifier of the correct size.
+    """
+    class_num = get_num_classes(args.dataset)
+    modality_name_list = []
+    from dataset.dataset import DATASET_HAS_AUDIO_LIST, \
+        DATASET_HAS_VISUAL_LIST, DATASET_HAS_TEXT_LIST
+    if args.dataset in DATASET_HAS_TEXT_LIST:
+        modality_name_list.append(M_TEXT_NAME)
+    if args.dataset in DATASET_HAS_VISUAL_LIST:
+        modality_name_list.append(M_VISUAL_NAME)
+    if args.dataset in DATASET_HAS_AUDIO_LIST:
+        modality_name_list.append(M_AUDIO_NAME)
+    modality_name_list.sort()
+
+    modifier = GradModifier(embed_dim=embedding_dim)
+    head = MLASum(embedding_dim, class_num, modality_name_list,
+                  grad_modifier=modifier)
+    head.apply(weight_init)
+    return head
 
 
 def forward_encoders(model_dict: nn.ModuleDict, input_dict: dict, use_ws: bool = False):
